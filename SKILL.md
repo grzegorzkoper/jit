@@ -1,13 +1,13 @@
 ---
 name: jit
-description: Use the `jit` CLI to interact with Jira issues from the terminal. Trigger when users ask to fetch issue summaries from ticket keys or Jira URLs, show detailed ticket fields, include description/comments/timestamps, include linked GitHub pull requests, filter comments by date, list current sprint tickets assigned to the current user, create backlog tickets, create tickets in the current sprint, edit existing issues or tasks, format output as table/text/JSON, or configure Jira credentials for `jit`.
+description: Use the `jit` CLI to interact with Jira issues from the terminal. Trigger when users ask to fetch issue summaries from ticket keys or Jira URLs, show detailed ticket fields, include description/comments/timestamps, include linked GitHub pull requests, filter comments by date, list current sprint tickets assigned to the current user, create backlog tickets, create tickets in the current sprint, edit existing issues or tasks, add or list worklogs, format output as table/text/JSON, or configure Jira credentials for `jit`.
 ---
 
 # Jit CLI
 
 ## Overview
 
-Use this skill to execute `jit` for common Jira workflows: ticket lookup, detailed issue inspection, current sprint ticket listing, backlog ticket creation, current-sprint ticket creation, ticket/task editing, and structured output for scripts.
+Use this skill to execute `jit` for common Jira workflows: ticket lookup, detailed issue inspection, current sprint ticket listing, backlog ticket creation, current-sprint ticket creation, ticket/task editing, adding and listing worklogs, and structured output for scripts.
 
 ## Prerequisites
 
@@ -86,7 +86,19 @@ jit edit RW-123 --type Task --summary "Refine task summary"
 jit edit RW-123 --assignee me
 jit edit RW-123 --summary "Improve edit flow" --json
 ```
-10. Use a specific config file:
+10. Add a worklog entry to an issue:
+```bash
+jit worklog add --time-spent 1h RT-2557
+jit worklog add --time-spent 1h 30m --comment "Fixing login bug" RT-2557
+jit worklog add --time-spent 45m --started 2026-05-08T10:00:00.000+0200 RT-2557
+jit worklog add --time-spent 2h --comment "Code review" RT-2557 --json
+```
+11. List worklogs for an issue:
+```bash
+jit worklog list RT-2557
+jit worklog list RT-2557 --json
+```
+12. Use a specific config file:
 ```bash
 jit --config-file /path/to/config.toml ISSUE-123
 jit --config-file /path/to/config.toml --my-tickets
@@ -105,6 +117,7 @@ jit --config-file /path/to/config.toml edit RW-123 --summary "Improve edit flow"
 - Backlog ticket creation
 - Current sprint ticket creation
 - Ticket or task editing
+- Adding or listing worklogs on an issue
 2. Normalize input:
 - If the user provides a Jira URL, pass it directly to `jit`.
 - If the user provides a ticket key, pass the key directly.
@@ -155,6 +168,9 @@ jit --config-file /path/to/config.toml edit RW-123 --summary "Improve edit flow"
 8. Edit command rejected by Jira:
 - Symptom: `JIRA API request failed with status ...` during `jit edit`
 - Fix: verify the issue key, edited field values, assignee account ID, and whether the Jira project restricts issue type or assignee transitions
+9. Worklog add rejected by Jira:
+- Symptom: `JIRA API request failed with status ...` during `jit worklog add`
+- Fix: verify the time-spent format (e.g. `30m`, `1h`, `1h 30m`), that the issue allows logging work, and the user has worklog permissions
 
 ## Response Style
 
@@ -163,3 +179,4 @@ jit --config-file /path/to/config.toml edit RW-123 --summary "Improve edit flow"
 3. Never print or expose `JIRA_API_TOKEN` values in outputs.
 4. When `--json` is requested, preserve JSON exactly and avoid additional prose around the payload.
 5. For creation requests, be explicit about whether the issue stays in the backlog or is added to the current sprint, mention that assignee defaults to the current Jira user, and note that board/sprint visibility still depends on Jira configuration.
+6. For worklog commands, use Jira-native time format (`30m`, `1h`, `1h 30m`) and include the comment when provided.

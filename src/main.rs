@@ -12,7 +12,16 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use unicode_width::UnicodeWidthStr;
+
+mod api;
+mod discovery;
+mod workflow;
+
+const DEFAULT_TICKET_LIMIT: u32 = 50;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -26,12 +35,49 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Create a new Jira issue without sprint assignment so it lands in the backlog on scrum boards
+    /// Configure Jira credentials interactively
+    Auth,
+    /// Search Jira issues with JQL
+    Search(discovery::SearchArgs),
+    /// List accessible Jira boards
+    Boards(discovery::BoardsArgs),
+    /// List sprints on a board
+    Sprints(discovery::SprintsArgs),
+    /// List available workflow transitions for an issue
+    Transitions(workflow::TransitionsArgs),
+    /// Move an issue through its workflow
+    Transition(workflow::TransitionArgs),
+    /// Add a comment to an issue
+    Comment(workflow::CommentArgs),
+    /// Link related issues
+    Link(workflow::LinkArgs),
+    /// Create a Jira issue assigned to you in the current sprint by default
     Create(CreateArgs),
-    /// Edit an existing Jira ticket's core fields, including Task issues
+    /// Edit an existing Jira ticket's fields or move it into the current sprint
     Edit(EditArgs),
     /// Add and inspect Jira worklogs for an issue
     Worklog(WorklogArgs),
+    /// Manage the shared jit agent skill (SKILL.md) installed for coding agents like Codex and Claude Code
+    Skill(SkillArgs),
+}
+
+#[derive(Args, Debug)]
+struct SkillArgs {
+    #[command(subcommand)]
+    command: SkillCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    /// Install the bundled skill for agents with existing config folders, or selected agents
+    Install(SkillInstallArgs),
+}
+
+#[derive(Args, Debug)]
+struct SkillInstallArgs {
+    /// Agents: codex, claude, pi, cursor, antigravity. Comma-separated or repeat --agent; defaults to detected config folders
+    #[clap(long, value_delimiter = ',')]
+    agent: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -83,8 +129,8 @@ struct QueryArgs {
     #[clap(long)]
     since: Option<String>,
 
-    /// Maximum number of tickets to retrieve (default: 10)
-    #[clap(long, default_value = "10")]
+    /// Maximum number of tickets to retrieve
+    #[clap(long, default_value_t = DEFAULT_TICKET_LIMIT, value_parser = clap::value_parser!(u32).range(1..))]
     limit: u32,
 
     /// Path to a custom config.toml file
@@ -92,7 +138,7 @@ struct QueryArgs {
     config_file: Option<PathBuf>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct CreateArgs {
     /// Jira project key (e.g., RW)
     #[clap(long)]
@@ -103,8 +149,12 @@ struct CreateArgs {
     summary: String,
 
     /// Plain-text ticket description
-    #[clap(long)]
+    #[clap(long, conflicts_with = "description_file")]
     description: Option<String>,
+
+    /// Read the plain-text description from a UTF-8 file, or '-' for stdin
+    #[clap(long, conflicts_with = "description")]
+    description_file: Option<PathBuf>,
 
     /// Jira issue type name, such as Task, Bug, or Story (default: Task)
     #[clap(long = "type", default_value = "Task")]
@@ -114,12 +164,16 @@ struct CreateArgs {
     #[clap(long, default_value = "me")]
     assignee: String,
 
-    /// Add the created ticket to the current active sprint instead of leaving it in the backlog
-    #[clap(long)]
+    /// Add the created ticket to the current active sprint (the default)
+    #[clap(long, conflicts_with = "backlog")]
     current_sprint: bool,
 
+    /// Leave the created ticket in the backlog without sprint assignment
+    #[clap(long, conflicts_with_all = ["current_sprint", "board"])]
+    backlog: bool,
+
     /// Jira board ID to use for current sprint selection; otherwise the most recently started active sprint is used
-    #[clap(long, requires = "current_sprint")]
+    #[clap(long, conflicts_with = "backlog")]
     board: Option<u64>,
 
     /// Output created issue details in JSON format
@@ -127,7 +181,7 @@ struct CreateArgs {
     json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct EditArgs {
     /// JIRA issue key (e.g., RW-1931) or URL (e.g., https://company.atlassian.net/browse/RW-1931)
     ticket: String,
@@ -137,8 +191,12 @@ struct EditArgs {
     summary: Option<String>,
 
     /// Updated plain-text ticket description; pass an empty string to clear it
-    #[clap(long)]
+    #[clap(long, conflicts_with = "description_file")]
     description: Option<String>,
+
+    /// Read the plain-text description from a UTF-8 file, or '-' for stdin
+    #[clap(long, conflicts_with = "description")]
+    description_file: Option<PathBuf>,
 
     /// Updated Jira issue type name, such as Task, Bug, or Story
     #[clap(long = "type")]
@@ -147,6 +205,14 @@ struct EditArgs {
     /// Updated assignee account ID, or `me` / `unassigned`
     #[clap(long)]
     assignee: Option<String>,
+
+    /// Move the existing ticket into the current active sprint
+    #[clap(long)]
+    current_sprint: bool,
+
+    /// Jira board ID to use for current sprint selection; otherwise the most recently started active sprint is used
+    #[clap(long, requires = "current_sprint")]
+    board: Option<u64>,
 
     /// Output updated issue details in JSON format
     #[clap(long)]
@@ -215,6 +281,8 @@ struct JiraIssueFields {
     sprint: Option<Vec<JiraSprint>>,
     #[serde(default)]
     description: Option<Value>,
+    #[serde(rename = "customfield_10396", default)]
+    acceptance_criteria: Option<Value>,
     #[serde(default)]
     assignee: Option<JiraUser>,
     #[serde(default)]
@@ -307,11 +375,6 @@ struct JiraPullRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct JiraSearchResponse {
-    issues: Vec<JiraIssue>,
-}
-
-#[derive(Debug, Deserialize)]
 struct JiraCreatedIssue {
     id: String,
     key: String,
@@ -392,13 +455,113 @@ struct JiraConfig {
     base_url: String,
     api_token: String,
     user_email: String,
+    #[serde(default = "default_sprint_field")]
+    sprint_field: String,
+    #[serde(default = "default_acceptance_criteria_field")]
+    acceptance_criteria_field: String,
 }
 
-fn main() -> Result<()> {
-    let args = Cli::parse();
+fn default_sprint_field() -> String {
+    "customfield_10020".to_owned()
+}
+fn default_acceptance_criteria_field() -> String {
+    "customfield_10396".to_owned()
+}
 
+#[derive(Debug)]
+struct MutationContext {
+    ticket: String,
+    completed_operations: Vec<&'static str>,
+    message: String,
+}
+impl std::fmt::Display for MutationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn error_json(error: &anyhow::Error, ticket: Option<&str>, code_override: Option<&str>) -> Value {
+    let mutation = error.downcast_ref::<MutationContext>();
+    let api_error = error.downcast_ref::<api::ApiError>();
+    let completed = mutation
+        .map(|context| context.completed_operations.as_slice())
+        .unwrap_or(&[]);
+    let code = code_override.unwrap_or_else(|| {
+        if !completed.is_empty() {
+            "partial_failure"
+        } else {
+            api_error.map_or("command_failed", api::ApiError::code)
+        }
+    });
+    json!({"error": {
+        "code": code,
+        "message": format!("{error:#}"),
+        "ticket": mutation.map(|context| context.ticket.as_str()).or(ticket),
+        "completed_operations": completed,
+        "status": api_error.map(|error| error.status),
+    }})
+}
+
+fn main() {
+    let mut args = match Cli::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            if error.use_stderr() && std::env::args().any(|arg| arg == "--json") {
+                eprintln!(
+                    "{}",
+                    error_json(&anyhow!(error.to_string()), None, Some("invalid_arguments"))
+                );
+                std::process::exit(2);
+            }
+            error.exit();
+        }
+    };
+    let query_json = args.query.json;
+    let json_flag = match &mut args.command {
+        Some(Commands::Create(a)) => &mut a.json,
+        Some(Commands::Edit(a)) => &mut a.json,
+        Some(Commands::Search(a)) => &mut a.json,
+        Some(Commands::Boards(a)) => &mut a.json,
+        Some(Commands::Sprints(a)) => &mut a.json,
+        Some(Commands::Transitions(a)) => &mut a.json,
+        Some(Commands::Transition(a)) => &mut a.json,
+        Some(Commands::Comment(a)) => &mut a.json,
+        Some(Commands::Link(a)) => &mut a.json,
+        _ => &mut args.query.json,
+    };
+    *json_flag |= query_json;
+    let json_output = *json_flag;
+    let ticket = match &args.command {
+        Some(Commands::Edit(a)) => Some(a.ticket.as_str()),
+        Some(Commands::Transitions(a)) => Some(a.ticket.as_str()),
+        Some(Commands::Transition(a)) => Some(a.ticket.as_str()),
+        Some(Commands::Comment(a)) => Some(a.ticket.as_str()),
+        Some(Commands::Link(a)) => Some(a.ticket.as_str()),
+        _ => args.query.ticket.as_deref(),
+    }
+    .and_then(|ticket| extract_ticket_id(ticket).ok());
+    if let Err(error) = run(args) {
+        if json_output {
+            eprintln!("{}", error_json(&error, ticket.as_deref(), None));
+        } else {
+            eprintln!("Error: {error:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run(args: Cli) -> Result<()> {
     if let Some(since) = args.query.since.as_deref() {
         validate_since_date(since)?;
+    }
+
+    if matches!(args.command, Some(Commands::Auth)) {
+        return run_auth_command(args.query.config_file.as_deref());
+    }
+
+    if let Some(Commands::Skill(skill_args)) = args.command.as_ref() {
+        let SkillCommands::Install(install_args) = &skill_args.command;
+        return run_skill_install_command(install_args);
     }
 
     let config = load_configuration(&args.query)?;
@@ -406,6 +569,8 @@ fn main() -> Result<()> {
     let client = create_jira_client(&config.user_email, &config.api_token)?;
 
     match args.command {
+        Some(Commands::Auth) => unreachable!("auth command is handled before loading config"),
+        Some(Commands::Skill(_)) => unreachable!("skill command is handled before loading config"),
         Some(Commands::Create(create_args)) => {
             run_create_issue_command(&client, &config.base_url, &create_args)
         }
@@ -415,14 +580,25 @@ fn main() -> Result<()> {
         Some(Commands::Worklog(worklog_args)) => {
             run_worklog_command(&client, &config.base_url, &worklog_args)
         }
-        None => run_query_mode(&client, &config.base_url, args.query),
+        Some(Commands::Search(a)) => {
+            discovery::run_search(&client, &config.base_url, &a, &config.sprint_field)
+        }
+        Some(Commands::Boards(a)) => discovery::run_boards(&client, &config.base_url, &a),
+        Some(Commands::Sprints(a)) => discovery::run_sprints(&client, &config.base_url, &a),
+        Some(Commands::Transitions(a)) => workflow::run_transitions(&client, &config.base_url, &a),
+        Some(Commands::Transition(a)) => workflow::run_transition(&client, &config.base_url, &a),
+        Some(Commands::Comment(a)) => workflow::run_comment(&client, &config.base_url, &a),
+        Some(Commands::Link(a)) => workflow::run_link(&client, &config.base_url, &a),
+        None => run_query_mode(&client, &config, args.query),
     }
 }
 
-fn run_query_mode(client: &Client, jira_base_url: &str, args: QueryArgs) -> Result<()> {
+fn run_query_mode(client: &Client, config: &JiraConfig, args: QueryArgs) -> Result<()> {
+    let jira_base_url = config.base_url.as_str();
     if args.my_tickets || args.ticket.is_none() {
         // Fetch and display current tickets
-        let tickets = fetch_my_tickets(client, jira_base_url, args.limit)?;
+        let (tickets, truncated) =
+            fetch_my_tickets(client, jira_base_url, args.limit, &config.sprint_field)?;
         let include_prs = args.include_prs || args.full;
         let pull_requests_by_key = if include_prs {
             Some(fetch_pull_requests_for_tickets(
@@ -433,7 +609,28 @@ fn run_query_mode(client: &Client, jira_base_url: &str, args: QueryArgs) -> Resu
         } else {
             None
         };
+        if args.json {
+            let issues: Vec<_> = tickets
+                .iter()
+                .map(|issue| {
+                    let prs = pull_requests_by_key
+                        .as_ref()
+                        .and_then(|by_key| by_key.get(&issue.key))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    build_issue_json(issue, false, false, include_prs, prs, 0, false, None)
+                })
+                .collect();
+            println!("{}", json!({"issues":issues,"truncated":truncated}));
+            return Ok(());
+        }
         display_tickets_table(&tickets, pull_requests_by_key.as_ref())?;
+        if truncated {
+            eprintln!(
+                "Results truncated at {} issues; increase --limit to see more.",
+                args.limit
+            );
+        }
     } else if let Some(ticket_input) = args.ticket {
         // Extract ticket ID from URL if needed
         let ticket_id = extract_ticket_id(&ticket_input)?;
@@ -455,6 +652,7 @@ fn run_query_mode(client: &Client, jira_base_url: &str, args: QueryArgs) -> Resu
             include_details,
             include_description,
             include_comments,
+            (&config.sprint_field, &config.acceptance_criteria_field),
         )?;
 
         let pull_requests = if include_prs {
@@ -529,7 +727,8 @@ fn resolve_config_path(args: &QueryArgs) -> Result<PathBuf> {
         }
 
         return Err(anyhow!(
-            "Specified config.toml file not found at: {}",
+            "Specified config.toml file not found at: {}. Run `jit auth --config-file {}` to create it, or create the file manually.",
+            config_path.display(),
             config_path.display()
         ));
     }
@@ -545,18 +744,22 @@ fn resolve_config_path(args: &QueryArgs) -> Result<PathBuf> {
         }
 
         return Err(anyhow!(
-            "No configuration found. Create `config.toml` in the current directory or at `{}` with:\n[jira]\nbase_url = \"https://your-company.atlassian.net\"\napi_token = \"your_api_token_here\"\nuser_email = \"your_email@example.com\"",
+            "No configuration found. Run `jit auth` to configure Jira credentials, or create `config.toml` in the current directory or at `{}` with:\n[jira]\nbase_url = \"https://your-company.atlassian.net\"\napi_token = \"your_api_token_here\"\nuser_email = \"your_email@example.com\"",
             user_config.display()
         ));
     }
 
     Err(anyhow!(
-        "No configuration found. Create a `config.toml` file with:\n[jira]\nbase_url = \"https://your-company.atlassian.net\"\napi_token = \"your_api_token_here\"\nuser_email = \"your_email@example.com\""
+        "No configuration found. Run `jit auth` to configure Jira credentials, or create a `config.toml` file with:\n[jira]\nbase_url = \"https://your-company.atlassian.net\"\napi_token = \"your_api_token_here\"\nuser_email = \"your_email@example.com\""
     ))
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|path| path.join("jit").join("config.toml"))
+    dirs::home_dir().map(|path| config_path_from_home(&path))
+}
+
+fn config_path_from_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".config").join("jit").join("config.toml")
 }
 
 fn read_config_file(path: &Path) -> Result<JiraConfig> {
@@ -571,9 +774,313 @@ fn read_config_file(path: &Path) -> Result<JiraConfig> {
     Ok(config.jira)
 }
 
+fn run_auth_command(config_file: Option<&Path>) -> Result<()> {
+    let config_path = match config_file {
+        Some(path) => path.to_path_buf(),
+        None => default_config_path().context("Could not determine default config path")?,
+    };
+
+    let mut existing_config = None;
+    if config_path.exists() {
+        match read_config_file(&config_path) {
+            Ok(config) => {
+                println!("Existing Jira config found at {}", config_path.display());
+                println!("Base URL: {}", config.base_url);
+                println!("Email:    {}", config.user_email);
+                println!("Token:    {}", mask_token(&config.api_token));
+                existing_config = Some(config);
+            }
+            Err(err) => {
+                println!(
+                    "Existing config at {} could not be read:",
+                    config_path.display()
+                );
+                println!("{}", err);
+            }
+        }
+
+        if !prompt_yes_no("Overwrite this config? [y/N]: ")? {
+            println!("Leaving existing config unchanged.");
+            return Ok(());
+        }
+    }
+
+    let base_url_input = if let Some(config) = existing_config.as_ref() {
+        prompt_with_default("Jira company URL", &config.base_url)?
+    } else {
+        prompt_required("Jira company URL: ")?
+    };
+    let base_url = normalize_jira_base_url(&base_url_input)?;
+    let user_email = if let Some(config) = existing_config.as_ref() {
+        prompt_with_default("Jira account email", &config.user_email)?
+    } else {
+        prompt_required("Jira account email: ")?
+    };
+
+    let token_url = "https://id.atlassian.com/manage-profile/security/api-tokens";
+    println!("Open this URL to create an Atlassian API token:");
+    println!("{}", token_url);
+    if let Err(err) = open_url(token_url) {
+        println!("Could not open your browser automatically: {}", err);
+    }
+
+    let api_token = prompt_required("Paste API token: ")?;
+    let client = create_jira_client(&user_email, &api_token)?;
+    validate_jira_authentication(&client, &base_url)?;
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create config directory at {}", parent.display())
+        })?;
+    }
+
+    fs::write(
+        &config_path,
+        format_config_toml(&JiraConfig {
+            base_url,
+            api_token,
+            user_email,
+            sprint_field: existing_config
+                .as_ref()
+                .map(|config| config.sprint_field.clone())
+                .unwrap_or_else(default_sprint_field),
+            acceptance_criteria_field: existing_config
+                .as_ref()
+                .map(|config| config.acceptance_criteria_field.clone())
+                .unwrap_or_else(default_acceptance_criteria_field),
+        }),
+    )
+    .with_context(|| format!("Failed to write config file at {}", config_path.display()))?;
+
+    println!("Saved Jira credentials to {}", config_path.display());
+    Ok(())
+}
+
+const BUNDLED_SKILL: &str = include_str!("../SKILL.md");
+
+struct AgentTarget {
+    name: &'static str,
+    config_subpaths: &'static [&'static [&'static str]],
+}
+
+const AGENT_TARGETS: &[AgentTarget] = &[
+    AgentTarget {
+        name: "codex",
+        config_subpaths: &[&[".codex"]],
+    },
+    AgentTarget {
+        name: "claude",
+        config_subpaths: &[&[".claude"]],
+    },
+    AgentTarget {
+        name: "pi",
+        config_subpaths: &[&[".pi", "agent"]],
+    },
+    AgentTarget {
+        name: "cursor",
+        config_subpaths: &[&[".cursor"]],
+    },
+    AgentTarget {
+        name: "antigravity",
+        config_subpaths: &[&[".gemini", "config"], &[".gemini", "antigravity"]],
+    },
+];
+
+fn existing_agent_config(home: &Path, target: &AgentTarget) -> Option<PathBuf> {
+    target
+        .config_subpaths
+        .iter()
+        .map(|segments| home.join(segments.iter().collect::<PathBuf>()))
+        .find(|path| path.is_dir())
+}
+
+fn run_skill_install_command(args: &SkillInstallArgs) -> Result<()> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+
+    let mut targets = Vec::new();
+    if args.agent.is_empty() {
+        targets.extend(
+            AGENT_TARGETS
+                .iter()
+                .filter(|target| existing_agent_config(&home, target).is_some()),
+        );
+    } else {
+        for agent in &args.agent {
+            let agent = agent.trim().to_ascii_lowercase();
+            let target = AGENT_TARGETS
+                .iter()
+                .find(|target| target.name == agent)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Unknown agent '{}'. Supported: {}",
+                        agent,
+                        AGENT_TARGETS
+                            .iter()
+                            .map(|target| target.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            if !targets
+                .iter()
+                .any(|selected: &&AgentTarget| selected.name == target.name)
+            {
+                targets.push(target);
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        println!(
+            "No supported agent config folders found. Use --agent <name> to install explicitly."
+        );
+    }
+    for target in targets {
+        let config = existing_agent_config(&home, target)
+            .unwrap_or_else(|| home.join(target.config_subpaths[0].iter().collect::<PathBuf>()));
+        let path = config.join("skills").join("jit").join("SKILL.md");
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create skill directory at {}", parent.display())
+            })?;
+        }
+
+        fs::write(&path, BUNDLED_SKILL)
+            .with_context(|| format!("Failed to write SKILL.md to {}", path.display()))?;
+
+        println!("Installed {} skill at {}", target.name, path.display());
+    }
+
+    Ok(())
+}
+
+fn prompt_required(prompt: &str) -> Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(anyhow!(
+            "{} cannot be empty",
+            prompt.trim().trim_end_matches(':')
+        ));
+    }
+    Ok(value)
+}
+
+fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
+    print!("{} [{}]: ", prompt, default);
+    io::stdout().flush()?;
+
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    Ok(matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn normalize_jira_base_url(input: &str) -> Result<String> {
+    let base_url = input.trim().trim_end_matches('/').to_string();
+    if !base_url.starts_with("https://") && !base_url.starts_with("http://") {
+        return Err(anyhow!(
+            "Jira company URL must start with https:// or http://"
+        ));
+    }
+    Ok(base_url)
+}
+
+fn open_url(url: &str) -> Result<()> {
+    if std::env::var_os("JIT_AUTH_SKIP_OPEN").is_some() {
+        return Ok(());
+    }
+
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("cmd").args(["/C", "start", "", url]).status()
+    } else {
+        Command::new("xdg-open").arg(url).status()
+    }
+    .context("failed to launch browser command")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("browser command exited with {}", status))
+    }
+}
+
+fn format_config_toml(config: &JiraConfig) -> String {
+    format!(
+        "[jira]\nbase_url = {}\napi_token = {}\nuser_email = {}\nsprint_field = {}\nacceptance_criteria_field = {}\n",
+        toml_string(&config.base_url),
+        toml_string(&config.api_token),
+        toml_string(&config.user_email),
+        toml_string(&config.sprint_field),
+        toml_string(&config.acceptance_criteria_field)
+    )
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization should not fail")
+}
+
+fn mask_token(token: &str) -> String {
+    if token.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    "*".repeat(token.chars().count().min(8))
+}
+
+fn read_text_input(inline: Option<&str>, file: Option<&Path>) -> Result<Option<String>> {
+    if inline.is_some() && file.is_some() {
+        return Err(anyhow!("Pass inline text or a file, not both"));
+    }
+    if let Some(path) = file {
+        if path == Path::new("-") {
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .context("Failed to read UTF-8 text from stdin")?;
+            return Ok(Some(input));
+        }
+        return fs::read_to_string(path)
+            .with_context(|| format!("Failed to read UTF-8 text from {}", path.display()))
+            .map(Some);
+    }
+    Ok(inline.map(str::to_owned))
+}
+
 fn run_create_issue_command(client: &Client, jira_base_url: &str, args: &CreateArgs) -> Result<()> {
+    let mut resolved_args = args.clone();
+    resolved_args.description = read_text_input(
+        args.description.as_deref(),
+        args.description_file.as_deref(),
+    )?;
+    let args = &resolved_args;
     let resolved_assignee = resolve_create_assignee(client, jira_base_url, &args.assignee)?;
-    let resolved_sprint = resolve_target_sprint(client, jira_base_url, args)?;
+    let resolved_sprint = resolve_target_sprint(client, jira_base_url, args).context(
+        "Could not select the current sprint. Pass --board <id> to select a board or --backlog to create without sprint assignment.",
+    )?;
     let created_issue = create_jira_issue(
         client,
         jira_base_url,
@@ -583,10 +1090,11 @@ fn run_create_issue_command(client: &Client, jira_base_url: &str, args: &CreateA
     if let Some(sprint) = resolved_sprint.as_ref() {
         add_issue_to_sprint(client, jira_base_url, sprint.id, &created_issue.key).with_context(
             || {
-                format!(
-                    "Created {} but failed to add it to sprint {}",
-                    created_issue.key, sprint.name
-                )
+                MutationContext {
+                    ticket: created_issue.key.clone(),
+                    completed_operations: vec!["created"],
+                    message: format!("Created {} but failed to add it to sprint {}. Retry with jit edit {} --current-sprint --board {}.", created_issue.key, sprint.name, created_issue.key, sprint.board_id),
+                }
             },
         )?;
     }
@@ -630,31 +1138,62 @@ fn run_create_issue_command(client: &Client, jira_base_url: &str, args: &CreateA
 }
 
 fn run_edit_issue_command(client: &Client, jira_base_url: &str, args: &EditArgs) -> Result<()> {
-    if args.summary.is_none()
-        && args.description.is_none()
-        && args.issue_type.is_none()
-        && args.assignee.is_none()
-    {
+    let mut resolved_args = args.clone();
+    resolved_args.description = read_text_input(
+        args.description.as_deref(),
+        args.description_file.as_deref(),
+    )?;
+    let args = &resolved_args;
+    let has_core_edits = args.summary.is_some()
+        || args.description.is_some()
+        || args.issue_type.is_some()
+        || args.assignee.is_some();
+    if !has_core_edits && !args.current_sprint {
         return Err(anyhow!(
-            "No editable fields provided. Pass at least one of --summary, --description, --type, or --assignee."
+            "No editable fields provided. Pass at least one of --summary, --description, --type, --assignee, or --current-sprint."
         ));
     }
 
     let ticket_id = extract_ticket_id(&args.ticket)?;
+    let resolved_sprint = resolve_current_sprint(
+        client,
+        jira_base_url,
+        ticket_id
+            .split_once('-')
+            .map_or(ticket_id.as_str(), |(project, _)| project),
+        args.current_sprint,
+        args.board,
+    )?;
     let resolved_assignee = args
         .assignee
         .as_deref()
         .map(|assignee| resolve_create_assignee(client, jira_base_url, assignee))
         .transpose()?;
-    update_jira_issue(
-        client,
-        jira_base_url,
-        &ticket_id,
-        args,
-        resolved_assignee
-            .as_ref()
-            .and_then(|assignee| assignee.account_id.as_deref()),
-    )?;
+    if has_core_edits {
+        update_jira_issue(
+            client,
+            jira_base_url,
+            &ticket_id,
+            args,
+            resolved_assignee
+                .as_ref()
+                .and_then(|assignee| assignee.account_id.as_deref()),
+        )?;
+    }
+    if let Some(sprint) = resolved_sprint.as_ref() {
+        add_issue_to_sprint(client, jira_base_url, sprint.id, &ticket_id).with_context(|| {
+            let prefix = if has_core_edits {
+                "Updated core fields, but "
+            } else {
+                ""
+            };
+            MutationContext {
+                ticket: ticket_id.clone(),
+                completed_operations: if has_core_edits { vec!["core_fields_updated"] } else { vec![] },
+                message: format!("{}failed to add {} to sprint {}. Retry with jit edit {} --current-sprint --board {}.", prefix, ticket_id, sprint.name, ticket_id, sprint.board_id),
+            }
+        })?;
+    }
 
     let issue_url = format!("{}/browse/{}", jira_base_url, ticket_id);
     let mut updated_fields = Vec::new();
@@ -671,6 +1210,10 @@ fn run_edit_issue_command(client: &Client, jira_base_url: &str, args: &EditArgs)
         updated_fields.push("assignee");
     }
 
+    if resolved_sprint.is_some() {
+        updated_fields.push("sprint");
+    }
+
     if args.json {
         let mut payload = json!({
             "ticket": ticket_id,
@@ -679,6 +1222,12 @@ fn run_edit_issue_command(client: &Client, jira_base_url: &str, args: &EditArgs)
         });
 
         if let Some(obj) = payload.as_object_mut() {
+            if let Some(sprint) = resolved_sprint.as_ref() {
+                obj.insert("sprint".to_string(), json!(sprint.name));
+                obj.insert("sprint_id".to_string(), json!(sprint.id));
+                obj.insert("board".to_string(), json!(sprint.board_name));
+                obj.insert("board_id".to_string(), json!(sprint.board_id));
+            }
             if let Some(summary) = args.summary.as_ref() {
                 obj.insert("summary".to_string(), json!(summary));
             }
@@ -722,6 +1271,10 @@ fn run_edit_issue_command(client: &Client, jira_base_url: &str, args: &EditArgs)
                     "Updated"
                 }
             );
+        }
+        if let Some(sprint) = resolved_sprint.as_ref() {
+            println!("Board:    {}", sprint.board_name);
+            println!("Sprint:   {}", sprint.name);
         }
         println!("URL:      {}", issue_url);
     }
@@ -848,13 +1401,15 @@ fn fetch_jira_issue(
     include_details: bool,
     include_description: bool,
     include_comments: bool,
+    field_ids: (&str, &str),
 ) -> Result<JiraIssue> {
+    let (sprint_field, acceptance_criteria_field) = field_ids;
     let mut fields = vec!["summary"];
 
     if include_details {
         fields.extend([
             "status",
-            "customfield_10020",
+            sprint_field,
             "assignee",
             "reporter",
             "priority",
@@ -867,6 +1422,7 @@ fn fetch_jira_issue(
 
     if include_description {
         fields.push("description");
+        fields.push(acceptance_criteria_field);
     }
 
     if include_comments {
@@ -888,51 +1444,120 @@ fn fetch_jira_issue(
         .send()
         .context("Failed to send request to JIRA API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "JIRA API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
+    let response = api::checked_response(response)?;
 
-    let issue: JiraIssue = response
+    let mut value: Value = response
         .json()
         .context("Failed to parse JIRA API response")?;
-
-    Ok(issue)
+    if include_comments {
+        let comment = &value["fields"]["comment"];
+        let count = comment["comments"].as_array().map_or(0, Vec::len);
+        if comment["total"]
+            .as_u64()
+            .is_some_and(|total| total > count as u64)
+            || comment["startAt"].as_u64().is_some_and(|start| start > 0)
+        {
+            value["fields"]["comment"]["comments"] =
+                json!(fetch_all_comments(client, base_url, issue_key)?);
+        }
+    }
+    decode_issue(value, sprint_field, acceptance_criteria_field)
 }
 
-fn fetch_my_tickets(client: &Client, base_url: &str, limit: u32) -> Result<Vec<JiraIssue>> {
-    // Jira removed /rest/api/3/search for JQL queries in favor of /search/jql.
-    let url = format!("{}/rest/api/3/search/jql", base_url);
+fn fetch_all_comments(client: &Client, base_url: &str, issue_key: &str) -> Result<Vec<Value>> {
+    let mut comments = Vec::new();
+    let mut start = 0_u64;
+    loop {
+        let page = api::json_response(
+            client
+                .get(format!("{base_url}/rest/api/3/issue/{issue_key}/comment"))
+                .query(&[("startAt", start), ("maxResults", 100)])
+                .send()?,
+        )?;
+        let values = page["comments"]
+            .as_array()
+            .context("Jira comment response is missing comments")?;
+        let total = page["total"]
+            .as_u64()
+            .context("Jira comment response is missing total")?;
+        if page["startAt"]
+            .as_u64()
+            .is_some_and(|offset| offset != start)
+        {
+            return Err(anyhow!("Jira comment pagination did not advance"));
+        }
+        let next = start + values.len() as u64;
+        comments.extend(values.iter().cloned());
+        if next >= total {
+            break;
+        }
+        if next == start {
+            return Err(anyhow!("Jira comment pagination did not advance"));
+        }
+        start = next;
+    }
+    Ok(comments)
+}
 
-    // JQL query to find issues assigned to the current user in the active sprint
-    let query = json!({
-        "jql": "assignee = currentUser() AND sprint in openSprints() ORDER BY updated DESC",
-        "maxResults": limit,
-        "fields": ["summary", "status", "customfield_10020"]
-    });
+fn decode_issue(
+    mut value: Value,
+    sprint_field: &str,
+    acceptance_criteria_field: &str,
+) -> Result<JiraIssue> {
+    if let Some(fields) = value.get_mut("fields").and_then(Value::as_object_mut) {
+        for (configured, canonical) in [
+            (sprint_field, "customfield_10020"),
+            (acceptance_criteria_field, "customfield_10396"),
+        ] {
+            if configured != canonical {
+                fields.remove(canonical);
+                if let Some(value) = fields.remove(configured) {
+                    fields.insert(canonical.to_owned(), value);
+                }
+            }
+        }
+    }
+    serde_json::from_value(value).context("Failed to parse JIRA issue response")
+}
 
+fn fetch_my_tickets(
+    client: &Client,
+    base_url: &str,
+    limit: u32,
+    sprint_field: &str,
+) -> Result<(Vec<JiraIssue>, bool)> {
+    let (values, truncated) = discovery::search_issues(
+        client,
+        base_url,
+        "assignee = currentUser() AND sprint in openSprints() ORDER BY updated DESC",
+        &["summary", "status", "assignee", sprint_field],
+        limit,
+    )?;
+    if values.is_empty() {
+        validate_jira_authentication(client, base_url)?;
+    }
+    let issues = values
+        .into_iter()
+        .map(|value| decode_issue(value, sprint_field, "customfield_10396"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((issues, truncated))
+}
+
+fn validate_jira_authentication(client: &Client, base_url: &str) -> Result<()> {
+    let url = format!("{}/rest/api/3/myself", base_url);
     let response = client
-        .post(&url)
-        .json(&query)
+        .get(&url)
         .send()
         .context("Failed to send request to JIRA API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "JIRA API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
-
-    let search_result: JiraSearchResponse = response
-        .json()
-        .context("Failed to parse JIRA API response")?;
-
-    Ok(search_result.issues)
+    let status = response.status();
+    api::empty_response(response).with_context(|| {
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            format!("Jira authentication failed with status: {status}. Check your Jira email and API token.")
+        } else {
+            format!("Jira authentication check failed with status: {status}")
+        }
+    })
 }
 
 fn create_jira_issue(
@@ -950,13 +1575,7 @@ fn create_jira_issue(
         .send()
         .context("Failed to send request to JIRA API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "JIRA API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
+    let response = api::checked_response(response)?;
 
     response.json().context("Failed to parse JIRA API response")
 }
@@ -977,15 +1596,7 @@ fn update_jira_issue(
         .send()
         .context("Failed to send request to JIRA API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "JIRA API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
-
-    Ok(())
+    api::empty_response(response)
 }
 
 fn create_issue_worklog(
@@ -1056,8 +1667,7 @@ fn fetch_issue_worklogs(
         } else {
             page.start_at + fetched
         };
-        let is_last_page =
-            fetched == 0 || (page.total > 0 && next_start_at >= page.total);
+        let is_last_page = fetched == 0 || (page.total > 0 && next_start_at >= page.total);
 
         worklogs.extend(page.worklogs);
 
@@ -1096,13 +1706,7 @@ fn fetch_current_user_assignee(client: &Client, base_url: &str) -> Result<Resolv
         .send()
         .context("Failed to send request to JIRA API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "JIRA API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
+    let response = api::checked_response(response)?;
 
     let current_user: JiraUser = response
         .json()
@@ -1127,14 +1731,24 @@ fn resolve_target_sprint(
     base_url: &str,
     args: &CreateArgs,
 ) -> Result<Option<ResolvedSprint>> {
-    if !args.current_sprint {
+    resolve_current_sprint(client, base_url, &args.project, !args.backlog, args.board)
+}
+
+fn resolve_current_sprint(
+    client: &Client,
+    base_url: &str,
+    project: &str,
+    current_sprint: bool,
+    board: Option<u64>,
+) -> Result<Option<ResolvedSprint>> {
+    if !current_sprint {
         return Ok(None);
     }
 
-    let sprint = if let Some(board_id) = args.board {
+    let sprint = if let Some(board_id) = board {
         resolve_active_sprint_for_board(client, base_url, board_id)?
     } else {
-        resolve_latest_active_sprint_for_project(client, base_url, &args.project)?
+        resolve_latest_active_sprint_for_project(client, base_url, project)?
     };
 
     Ok(Some(sprint))
@@ -1173,7 +1787,7 @@ fn resolve_latest_active_sprint_for_project(
 
     best.ok_or_else(|| {
         anyhow!(
-            "No active sprint found on accessible Scrum boards for project {}. Create without --current-sprint or pass --board <id>.",
+            "No active sprint found on accessible Scrum boards for project {}. Start a sprint in Jira or pass --board <id> to select a different board.",
             project_key
         )
     })
@@ -1187,7 +1801,7 @@ fn resolve_active_sprint_for_board(
     let board = fetch_board(client, base_url, board_id)?;
     let sprint = fetch_active_sprints_for_board(client, base_url, board_id)?.ok_or_else(|| {
         anyhow!(
-            "No active sprint found on board {} ({}).",
+            "No active sprint found on board {} ({}). Start a sprint in Jira or pass --board <id> to select a different board.",
             board.id,
             board.name
         )
@@ -1220,13 +1834,7 @@ fn fetch_scrum_boards_for_project(
             .send()
             .context("Failed to send request to Jira Agile API")?;
 
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Jira Agile API request failed with status: {} - {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        let response = api::checked_response(response)?;
 
         let page: JiraBoardPage = response
             .json()
@@ -1251,13 +1859,7 @@ fn fetch_board(client: &Client, base_url: &str, board_id: u64) -> Result<JiraBoa
         .send()
         .context("Failed to send request to Jira Agile API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Jira Agile API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
+    let response = api::checked_response(response)?;
 
     response
         .json()
@@ -1282,13 +1884,7 @@ fn fetch_active_sprints_for_board(
             .send()
             .context("Failed to send request to Jira Agile API")?;
 
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Jira Agile API request failed with status: {} - {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        let response = api::checked_response(response)?;
 
         let page: JiraSprintPage = response
             .json()
@@ -1324,15 +1920,7 @@ fn add_issue_to_sprint(
         .send()
         .context("Failed to send request to Jira Agile API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Jira Agile API request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
-
-    Ok(())
+    api::empty_response(response)
 }
 
 fn is_better_sprint_candidate(
@@ -1493,13 +2081,7 @@ fn fetch_issue_pull_requests(
         .send()
         .context("Failed to send request to Jira dev-status API")?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Jira dev-status request failed with status: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
+    let response = api::checked_response(response).context("Jira dev-status request failed")?;
 
     let dev_status: JiraDevStatusResponse = response
         .json()
@@ -1569,9 +2151,7 @@ fn display_tickets_table(
     for ticket in tickets {
         let status_text = ticket.fields.status.as_ref().map_or("Unknown", |s| &s.name);
         let summary = truncate_with_ellipsis(&ticket.fields.summary, 58);
-        let colored_status = get_colored_status(status_text);
-
-        let mut row = vec![ticket.key.clone(), summary, colored_status];
+        let mut row = vec![ticket.key.clone(), summary, status_text.to_string()];
         if let Some(pr_map) = pull_requests_by_key {
             let prs = pr_map
                 .get(&ticket.key)
@@ -1589,19 +2169,7 @@ fn display_tickets_table(
     }
     for row in &table {
         for (i, cell) in row.iter().enumerate() {
-            // For status column with color codes, use the length of the plain text
-            let cell_width = if i == 2 && row[0] != "Key" {
-                // This is a status cell, get the original text length
-                let status_text = tickets
-                    [table.iter().position(|r| &r[0] == &row[0]).unwrap_or(0) - 1]
-                    .fields
-                    .status
-                    .as_ref()
-                    .map_or("Unknown", |s| &s.name);
-                status_text.len()
-            } else {
-                cell.len()
-            };
+            let cell_width = cell.width();
 
             if i < col_widths.len() {
                 col_widths[i] = col_widths[i].max(cell_width + 2);
@@ -1623,25 +2191,13 @@ fn display_tickets_table(
     for (row_idx, row) in table.iter().enumerate() {
         print!("│");
         for (col_idx, cell) in row.iter().enumerate() {
-            let cell_text = if row_idx == 0 {
-                format!(" {:<width$}", cell, width = col_widths[col_idx] - 1)
-            } else if col_idx == 2 {
-                // Add proper spacing for colored status
-                let status_text = tickets[row_idx - 1]
-                    .fields
-                    .status
-                    .as_ref()
-                    .map_or("Unknown", |s| &s.name);
-                format!(
-                    " {}{}",
-                    cell,
-                    " ".repeat(col_widths[col_idx] - status_text.len() - 1)
-                )
+            let cell_text = if row_idx > 0 && col_idx == 2 {
+                get_colored_status(cell)
             } else {
-                format!(" {:<width$}", cell, width = col_widths[col_idx] - 1)
+                cell.clone()
             };
-
-            print!("{}", cell_text);
+            let padding = col_widths[col_idx] - cell.width() - 1;
+            print!(" {}{}", cell_text, " ".repeat(padding));
             print!("│");
         }
         println!();
@@ -1672,15 +2228,24 @@ fn display_tickets_table(
     Ok(())
 }
 
-// Truncate a string to max_len and add ellipsis if needed
+// Truncate to terminal display columns, including the ellipsis.
 fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.width() <= max_len {
         return s.to_string();
     }
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
 
-    let mut result = s.chars().take(max_len - 3).collect::<String>();
-    result.push_str("...");
-    result
+    let mut end = 0;
+    for (index, ch) in s.char_indices() {
+        let next = index + ch.len_utf8();
+        if s[..next].width() > max_len - 3 {
+            break;
+        }
+        end = next;
+    }
+    format!("{}...", &s[..end])
 }
 
 fn extract_pr_id_from_url(url: &str) -> Option<String> {
@@ -2195,6 +2760,20 @@ fn build_issue_json(
                 })
                 .unwrap_or(Value::Null);
             obj.insert("description".to_string(), description);
+
+            let acceptance_criteria = issue
+                .fields
+                .acceptance_criteria
+                .as_ref()
+                .map(|criteria| {
+                    if criteria.is_null() {
+                        Value::Null
+                    } else {
+                        Value::String(adf_value_to_display_text(criteria))
+                    }
+                })
+                .unwrap_or(Value::Null);
+            obj.insert("acceptance_criteria".to_string(), acceptance_criteria);
         }
 
         if include_comments {
@@ -2387,6 +2966,15 @@ fn display_detailed_ticket(
             }
             None => println!("No description provided."),
         }
+
+        if let Some(criteria) = &issue.fields.acceptance_criteria {
+            if !criteria.is_null() {
+                println!();
+                println!("{}", "ACCEPTANCE CRITERIA".bold());
+                println!();
+                println!("{}", adf_value_to_display_text(criteria));
+            }
+        }
     }
 
     if include_comments {
@@ -2546,6 +3134,36 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_skill_install_command() {
+        let cli = Cli::try_parse_from(["jit", "skill", "install"])
+            .expect("skill install command should parse");
+
+        match cli.command {
+            Some(Commands::Skill(args)) => match args.command {
+                SkillCommands::Install(install_args) => {
+                    assert!(install_args.agent.is_empty());
+                }
+            },
+            _ => panic!("expected skill install command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_skill_install_with_agent_filter() {
+        let cli = Cli::try_parse_from(["jit", "skill", "install", "--agent", "codex"])
+            .expect("skill install --agent should parse");
+
+        match cli.command {
+            Some(Commands::Skill(args)) => match args.command {
+                SkillCommands::Install(install_args) => {
+                    assert_eq!(install_args.agent, ["codex"]);
+                }
+            },
+            _ => panic!("expected skill install command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_config_file_flag() {
         let cli = Cli::try_parse_from(["jit", "--config-file", "/tmp/jit-config.toml", "RW-123"])
             .expect("config file flag should parse");
@@ -2555,6 +3173,14 @@ mod tests {
             Some(PathBuf::from("/tmp/jit-config.toml"))
         );
         assert_eq!(cli.query.ticket.as_deref(), Some("RW-123"));
+    }
+
+    #[test]
+    fn cli_defaults_my_tickets_limit_to_full_sprint_view() {
+        let cli =
+            Cli::try_parse_from(["jit", "--my-tickets"]).expect("my tickets flag should parse");
+
+        assert_eq!(cli.query.limit, 50);
     }
 
     #[test]
@@ -2581,6 +3207,16 @@ user_email = "user@example.com"
         assert_eq!(config.base_url, "https://example.atlassian.net");
         assert_eq!(config.api_token, "token-123");
         assert_eq!(config.user_email, "user@example.com");
+    }
+
+    #[test]
+    fn config_path_from_home_uses_dot_config_jit_directory() {
+        let path = config_path_from_home(Path::new("/Users/example"));
+
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/example/.config/jit/config.toml")
+        );
     }
 
     #[test]
@@ -2691,9 +3327,11 @@ user_email = "user@example.com"
             project: "RW".to_string(),
             summary: "Implement backlog creation".to_string(),
             description: Some("First line\nSecond line\n\nNew paragraph".to_string()),
+            description_file: None,
             issue_type: "Task".to_string(),
             assignee: "me".to_string(),
             current_sprint: false,
+            backlog: false,
             board: None,
             json: false,
         };
@@ -2734,8 +3372,11 @@ user_email = "user@example.com"
             ticket: "RW-123".to_string(),
             summary: Some("Updated summary".to_string()),
             description: Some("First line\nSecond line".to_string()),
+            description_file: None,
             issue_type: Some("Bug".to_string()),
             assignee: Some("account-id-123".to_string()),
+            current_sprint: false,
+            board: None,
             json: false,
         };
 
@@ -2766,9 +3407,11 @@ user_email = "user@example.com"
             project: "RW".to_string(),
             summary: "Implement backlog creation".to_string(),
             description: Some("   ".to_string()),
+            description_file: None,
             issue_type: "Task".to_string(),
             assignee: "unassigned".to_string(),
             current_sprint: false,
+            backlog: false,
             board: None,
             json: false,
         };
@@ -2785,8 +3428,11 @@ user_email = "user@example.com"
             ticket: "RW-123".to_string(),
             summary: None,
             description: Some(String::new()),
+            description_file: None,
             issue_type: None,
             assignee: Some("unassigned".to_string()),
+            current_sprint: false,
+            board: None,
             json: false,
         };
 
@@ -2886,9 +3532,11 @@ user_email = "user@example.com"
             project: "RW".to_string(),
             summary: "Implement backlog creation".to_string(),
             description: Some("Description text".to_string()),
+            description_file: None,
             issue_type: "Task".to_string(),
             assignee: "account-id-123".to_string(),
             current_sprint: false,
+            backlog: false,
             board: None,
             json: false,
         };
@@ -2927,8 +3575,11 @@ user_email = "user@example.com"
             ticket: "RW-123".to_string(),
             summary: Some("Updated summary".to_string()),
             description: Some("Description text".to_string()),
+            description_file: None,
             issue_type: Some("Story".to_string()),
             assignee: Some("account-id-123".to_string()),
+            current_sprint: false,
+            board: None,
             json: false,
         };
         let expected_payload = build_issue_update_payload(&args, Some("account-id-123"));
@@ -3039,9 +3690,11 @@ user_email = "user@example.com"
             project: "RW".to_string(),
             summary: "Implement backlog creation".to_string(),
             description: None,
+            description_file: None,
             issue_type: "Task".to_string(),
             assignee: "me".to_string(),
             current_sprint: true,
+            backlog: false,
             board: None,
             json: false,
         };
@@ -3062,15 +3715,17 @@ user_email = "user@example.com"
     }
 
     #[test]
-    fn resolve_target_sprint_returns_none_when_current_sprint_not_requested() {
+    fn resolve_target_sprint_returns_none_when_backlog_requested() {
         let client = create_jira_client("user@example.com", "token").expect("client");
         let args = CreateArgs {
             project: "RW".to_string(),
             summary: "Implement backlog creation".to_string(),
             description: None,
+            description_file: None,
             issue_type: "Task".to_string(),
             assignee: "me".to_string(),
             current_sprint: false,
+            backlog: true,
             board: None,
             json: false,
         };
@@ -3095,9 +3750,11 @@ user_email = "user@example.com"
             project: "RW".to_string(),
             summary: "Implement backlog creation".to_string(),
             description: None,
+            description_file: None,
             issue_type: "Task".to_string(),
             assignee: "me".to_string(),
             current_sprint: true,
+            backlog: false,
             board: Some(42),
             json: false,
         };
@@ -3211,8 +3868,16 @@ user_email = "user@example.com"
         );
         let client = create_jira_client("user@example.com", "token").expect("client");
 
-        let issue = fetch_jira_issue(&client, &base_url, "RW-123", true, true, true)
-            .expect("issue fetch should succeed");
+        let issue = fetch_jira_issue(
+            &client,
+            &base_url,
+            "RW-123",
+            true,
+            true,
+            true,
+            ("customfield_10020", "customfield_10396"),
+        )
+        .expect("issue fetch should succeed");
         let request = requests
             .recv_timeout(Duration::from_secs(2))
             .expect("request should be captured");
@@ -3220,7 +3885,7 @@ user_email = "user@example.com"
 
         assert_eq!(issue.key, "RW-123");
         assert!(request.starts_with("GET /rest/api/3/issue/RW-123?fields="));
-        assert!(request.contains("assignee,comment,created,customfield_10020,description,duedate,issuetype,priority,reporter,status,summary,updated"));
+        assert!(request.contains("assignee,comment,created,customfield_10020,customfield_10396,description,duedate,issuetype,priority,reporter,status,summary,updated"));
     }
 
     #[test]
@@ -3231,7 +3896,8 @@ user_email = "user@example.com"
         );
         let client = create_jira_client("user@example.com", "token").expect("client");
 
-        let issues = fetch_my_tickets(&client, &base_url, 7).expect("ticket fetch should succeed");
+        let (issues, _) = fetch_my_tickets(&client, &base_url, 7, "customfield_10020")
+            .expect("ticket fetch should succeed");
         let request = requests
             .recv_timeout(Duration::from_secs(2))
             .expect("request should be captured");
@@ -3308,6 +3974,15 @@ user_email = "user@example.com"
         let truncated = truncate_with_ellipsis("abcdefghijklmnopqrstuvwxyz", 10);
 
         assert_eq!(truncated, "abcdefg...");
+    }
+
+    #[test]
+    fn truncation_measures_terminal_columns_instead_of_bytes() {
+        assert_eq!(truncate_with_ellipsis("éééé", 4), "éééé");
+        assert_eq!(truncate_with_ellipsis("🌵ab", 4), "🌵ab");
+        assert_eq!(truncate_with_ellipsis("界界界", 5), "界...");
+        assert_eq!(truncate_with_ellipsis("abcdef", 2), "..");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
     }
 
     #[test]
@@ -3425,6 +4100,7 @@ user_email = "user@example.com"
                     state: "active".to_string(),
                 }]),
                 description: Some(text_to_adf("Hello\nWorld")),
+                acceptance_criteria: None,
                 assignee: Some(JiraUser {
                     display_name: "Cesar Ferreira".to_string(),
                     account_id: Some("account-id-123".to_string()),
@@ -3587,6 +4263,7 @@ user_email = "user@example.com"
                     state: "active".to_string(),
                 }]),
                 description: None,
+                acceptance_criteria: None,
                 assignee: None,
                 reporter: None,
                 priority: None,
@@ -3622,6 +4299,7 @@ user_email = "user@example.com"
                 }),
                 sprint: None,
                 description: None,
+                acceptance_criteria: None,
                 assignee: None,
                 reporter: None,
                 priority: None,

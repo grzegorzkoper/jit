@@ -134,10 +134,11 @@ jit transitions RW-123 --json
 jit transition RW-123 --to 'In Progress' --json
 jit comment RW-123 --body 'Verified the fix locally.' --json
 jit comment RW-123 --body-file /path/to/comment.txt --json
+jit comment RW-123 --body-file /path/to/update.jira --wiki --json
 jit link RW-123 --blocks RW-456 --json
 jit link RW-123 --to RW-456 --type 'Relates' --json
 ```
-List available transitions first; `--to` accepts a transition name or ID. The CLI does not supply transition-specific required fields (for example, resolution); Jira validation errors are surfaced. Comments require exactly one of `--body` or `--body-file`; `--body-file -` reads stdin. `--blocks` means SOURCE blocks TARGET. Generic links accept a Jira link-type name or ID; SOURCE displays the type's outward relationship to TARGET.
+List available transitions first; `--to` accepts a transition name or ID. The CLI does not supply transition-specific required fields (for example, resolution); Jira validation errors are surfaced. Comments require exactly one of `--body` or `--body-file`; `--body-file -` reads stdin. Bodies are plain text by default; add `--wiki` when the body uses Jira wiki markup (`h2.`, `||tables||`, `{code}`) so it renders instead of showing literally. `--blocks` means SOURCE blocks TARGET. Generic links accept a Jira link-type name or ID; SOURCE displays the type's outward relationship to TARGET.
 13. Supply descriptions from files or stdin:
 ```bash
 jit create --project RW --summary 'Improve validation' --description-file /path/to/description.txt

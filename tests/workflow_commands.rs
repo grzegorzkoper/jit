@@ -131,6 +131,34 @@ fn comment_posts_adf_and_returns_created_comment_id() {
 }
 
 #[test]
+fn comment_wiki_posts_markup_verbatim_to_v2_api() {
+    let (server, requests) =
+        spawn_sequence_server(vec![("HTTP/1.1 201 Created", r#"{"id":"12346"}"#)]);
+    let config = TempConfig::new(&server.base_url);
+    let markup = "h2. Update\n\n||A||B||\n|1|2|\n{code}x{code}";
+    let output = run_jit([
+        "--config-file",
+        config.path_str(),
+        "comment",
+        "RW-123",
+        "--body",
+        markup,
+        "--wiki",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let captured = collect_requests(&requests, 1);
+    assert!(captured[0].starts_with("POST /rest/api/2/issue/RW-123/comment"));
+    let body: Value = serde_json::from_str(request_body(&captured[0])).unwrap();
+    assert_eq!(body, json!({ "body": markup }));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&output)).unwrap()["id"],
+        "12346"
+    );
+    server.join();
+}
+
+#[test]
 fn comment_requires_nonempty_body_before_network() {
     let config = TempConfig::new("http://127.0.0.1:1");
     for extra in [vec![], vec!["--body", "   "]] {

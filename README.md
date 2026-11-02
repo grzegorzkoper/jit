@@ -353,6 +353,12 @@ jit comment RW-123 --body-file /path/to/comment.txt
 printf '%s' 'Verified the fix locally.' | jit comment RW-123 --body-file -
 ```
 
+By default the body is plain text: paragraphs and line breaks are kept, and markup is shown literally. Add `--wiki` to send Jira wiki markup (`h2.`, `||tables||`, `{code}`) through the v2 comment API, so it renders:
+
+```bash
+jit comment RW-123 --body-file update.jira --wiki
+```
+
 Create a dependency or use another Jira issue-link type by name or ID:
 
 ```bash
@@ -542,7 +548,7 @@ jit --config-file /path/to/config.toml edit RW-123 --summary "Improve edit flow"
 | `jit sprints --board ID [--state active,future]` | List board sprints |
 | `jit transitions KEY` | List available status transitions |
 | `jit transition KEY --to NAME_OR_ID` | Apply an available transition |
-| `jit comment KEY --body TEXT` | Add a comment; `--body-file PATH` also accepts `-` for stdin |
+| `jit comment KEY --body TEXT` | Add a comment; `--body-file PATH` also accepts `-` for stdin; `--wiki` renders Jira wiki markup |
 | `jit link SOURCE --blocks TARGET` | Mark the source as blocking the target |
 | `jit link SOURCE --to TARGET --type NAME_OR_ID` | Create a Jira issue link |
 | `jit create ...` | Create an issue assigned to you in the current sprint |

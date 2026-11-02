@@ -41,6 +41,9 @@ pub(crate) struct CommentArgs {
     /// Read comment text from a file, or '-' for stdin
     #[arg(long, conflicts_with = "body", required_unless_present = "body")]
     pub body_file: Option<PathBuf>,
+    /// Send the body as Jira wiki markup (h2., ||tables||, {code}) via the v2 API
+    #[arg(long)]
+    pub wiki: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -162,10 +165,16 @@ pub(crate) fn run_comment(client: &Client, base: &str, args: &CommentArgs) -> Re
     let body = read_text_input(args.body.as_deref(), args.body_file.as_deref())?
         .filter(|body| !body.trim().is_empty())
         .ok_or_else(|| anyhow!("Comment body must not be empty. Use --body or --body-file."))?;
+    // API v2 renders a string body as wiki markup; v3 needs ADF.
+    let (version, payload) = if args.wiki {
+        (2, json!({"body": body}))
+    } else {
+        (3, json!({"body": text_to_adf(&body)}))
+    };
     let response = json_response(
         client
-            .post(format!("{base}/rest/api/3/issue/{ticket}/comment"))
-            .json(&json!({"body":text_to_adf(&body)}))
+            .post(format!("{base}/rest/api/{version}/issue/{ticket}/comment"))
+            .json(&payload)
             .send()?,
     )?;
     if args.json {
